@@ -345,6 +345,11 @@ def discover(args):
         except Exception as exc:
             failures += 1
             print(f'[ERROR] {source["name"]}: {exc}', file=sys.stderr)
+    from platform_sources import run_watches
+    watched_added, watched_messages = run_watches(conn, now, args.days)
+    count += watched_added
+    for message in watched_messages:
+        print('[platform] ' + message)
     for ev in scan_manual(ROOT / 'manual_events.csv'):
         if qualify(ev, now, args.days):
             count += upsert(conn, ev)

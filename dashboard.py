@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 from zoneinfo import ZoneInfo
 
 from social import ensure_leads, platform_for_url, safe_url, add_lead
+from platform_sources import SOURCE_TYPES, ensure_watches, valid_source
 
 ROOT = Path(__file__).resolve().parent
 TZ = ZoneInfo('America/New_York')
@@ -82,6 +83,7 @@ def db():
         image_approved INTEGER NOT NULL DEFAULT 0, reddit_url TEXT, created_at TEXT NOT NULL
     )''')
     ensure_leads(c)
+    ensure_watches(c)
     c.execute('''CREATE TABLE IF NOT EXISTS scans (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL, log TEXT NOT NULL DEFAULT '')''')
     c.commit()
     return c
@@ -117,7 +119,7 @@ def scan_section(conn):
     else:
         info = 'No scans run from the dashboard yet.'
     form = btn_post('/scan/start', 'Scan for Events', 'btn dark')
-    return f'<section class="scanbox"><div><b>Discover upcoming Newark events</b><p class="small">City calendars and configured public sources. Instagram, Threads, Facebook and Nextdoor require approved API access. All discoveries go to review; no Reddit publishing.</p><p class="small">{info} · <a href="/scan">View scan results</a></p></div>{form}</section>'
+    return f'<section class="scanbox"><div><b>Discover upcoming Newark events</b><p class="small">City calendars and configured public sources. Instagram, Threads, Facebook and Nextdoor require approved API access. Manage Luma/Eventbrite feeds in Sources. All discoveries go to review; no Reddit publishing.</p><p class="small">{info} · <a href="/scan">View scan results</a></p></div>{form}</section>'
 
 
 def scan_page(conn):
@@ -188,7 +190,7 @@ def btn_post(action, label, klass='btn', extras='', content=''):
 def wrapper(title, body, selected='events', message=''):
     note = f'<div class="notice">{esc(message)}</div>' if message else ''
     return f'''<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{esc(title)} | Newark Events</title><style>{CSS}</style></head><body>
-<header><div class="shell"><div class="brand"><span class="mark">N.</span> NEWARK <span style="font-weight:400;color:#b8c7da">/ Event Desk</span></div><nav class="header-links"><a href="/">Events</a><a href="/leads">Social Leads</a><a href="/events/new">+ Add Event</a></nav></div></header>
+<header><div class="shell"><div class="brand"><span class="mark">N.</span> NEWARK <span style="font-weight:400;color:#b8c7da">/ Event Desk</span></div><nav class="header-links"><a href="/">Events</a><a href="/leads">Social Leads</a><a href="/sources">Sources</a><a href="/events/new">+ Add Event</a></nav></div></header>
 <main class="shell">{note}{body}<p class="footer">Private, review-first local dashboard · Nothing is published to Reddit from this screen.</p></main></body></html>'''
 
 
@@ -275,6 +277,34 @@ def leads_page(conn, params):
 <div class="field"><label>Caption or event notes (optional)</label><textarea name="post_text" placeholder="Paste the event details you've seen, including date, time and venue if available"></textarea></div><button class="btn primary" type="submit">Add to social leads</button></form></section>
 <h2 class="section-title">{len(rows)} social lead(s)</h2><div class="list">{''.join(lead_card(r) for r in rows) or '<div class="empty">No social leads yet. Paste a link above or configure Meta API access.</div>'}</div>'''
     return wrapper('Social discovery', body)
+
+
+
+def sources_page(conn, error=''):
+    watches = conn.execute('SELECT * FROM source_watches ORDER BY created_at DESC').fetchall()
+    opts = ''.join(f'<option value="{esc(k)}">{esc(v)}</option>' for k, v in SOURCE_TYPES.items())
+    rows = []
+    for r in watches:
+        identifier = r['value']
+        shown = identifier if len(identifier) <= 95 else identifier[:92] + '...'
+        label = SOURCE_TYPES[r['kind']]
+        button = btn_post(f'/sources/{r["id"]}/remove', 'Remove', 'btn danger')
+        rows.append(f'<tr><td>{esc(label)}</td><td style="overflow-wrap:anywhere">{esc(shown)}</td><td>{button}</td></tr>')
+    if rows:
+        current = '<table style="width:100%;border-collapse:separate;border-spacing:10px 16px"><thead><tr><th>Source</th><th>Link or ID</th><th>Action</th></tr></thead><tbody>' + ''.join(rows) + '</tbody></table>'
+    else:
+        current = '<p class="small">No Luma or Eventbrite sources added yet.</p>'
+    body = f'''<h1>Event sources</h1><p class="sub">Follow public Luma calendars, single event announcements, or authorized Eventbrite organizations. All qualifying results go into Needs review; nothing posts to Reddit.</p>
+    {'<div class="error">'+esc(error)+'</div>' if error else ''}
+    <section class="formbox"><h2 style="margin-top:0">Add a Luma or Eventbrite source</h2>
+    <form method="post" action="/sources/add">{hidden()}
+    <div class="field"><label for="kind">Source type</label><select name="kind" id="kind">{opts}</select></div>
+    <div class="field"><label for="value">Calendar feed URL, event URL or organization ID</label><input name="value" id="value" required placeholder="Paste an HTTPS link, or a numeric Eventbrite organization ID"></div>
+    <button class="btn primary" type="submit">Save source</button></form>
+    <p class="field-hint">For Luma: open a public Luma Calendar, select Add iCal Subscription, copy the feed URL. This follows future events. Eventbrite organization access requires EVENTBRITE_ACCESS_TOKEN in Railway; Eventbrite does not offer general public keyword/location search through its documented API.</p></section>
+    <h2 class="section-title">Watched sources ({len(watches)})</h2><section class="formbox" style="max-width:1100px">{current}</section>
+    <p class="small">After adding a source, go to <a href="/">Events</a> and click Scan for Events. If a single event link cannot be verified, it may appear in Social Leads for manual completion.</p>'''
+    return wrapper('Event sources', body)
 
 
 def fields_from_form(form):
@@ -367,6 +397,8 @@ class Handler(BaseHTTPRequestHandler):
                 self.respond(scan_page(conn)); return
             if u.path == '/leads':
                 self.respond(leads_page(conn, params)); return
+            if u.path == '/sources':
+                self.respond(sources_page(conn, params.get('error',[''])[0])); return
             if u.path == '/events/new':
                 lead = None
                 if params.get('lead'):
@@ -413,6 +445,20 @@ class Handler(BaseHTTPRequestHandler):
                         SCAN_ACTIVE = False
                         raise
                 self.redirect('/scan'); return
+            if u.path == '/sources/add':
+                kind = form.get('kind',[''])[0]
+                value = form.get('value',[''])[0]
+                try:
+                    value = valid_source(kind, value)
+                except ValueError as exc:
+                    self.redirect('/sources?error='+quote(str(exc))); return
+                conn.execute('INSERT OR IGNORE INTO source_watches (kind,value,created_at) VALUES (?,?,?)',
+                             (kind,value,datetime.now(timezone.utc).isoformat()))
+                conn.commit(); self.redirect('/sources'); return
+            match_source = re.fullmatch(r'/sources/(\d+)/remove', u.path)
+            if match_source:
+                conn.execute('DELETE FROM source_watches WHERE id=?', (int(match_source.group(1)),))
+                conn.commit(); self.redirect('/sources'); return
             if u.path == '/leads/add':
                 url = form.get('original_post_url',[''])[0]
                 if not safe_url(url): raise ValueError('Enter a valid social post URL')
