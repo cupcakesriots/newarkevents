@@ -358,6 +358,11 @@ def discover(args):
     social_added, social_messages = collect_social(conn)
     for message in social_messages:
         print('[social] ' + message)
+    # Eventbrite location-wide discovery uses a separately licensed search index,
+    # never Eventbrite HTML scraping or a retired Eventbrite API endpoint.
+    from eventbrite_newark_discovery import run_eventbrite_newark_discovery
+    for message in run_eventbrite_newark_discovery(conn):
+        print('[discovery] ' + message)
     export_review(conn, Path(args.review))
     print(f'Added {count} verified event(s), {social_added} social lead(s), {failures} calendar source error(s). Open the dashboard to review. No Reddit posts made.')
 
