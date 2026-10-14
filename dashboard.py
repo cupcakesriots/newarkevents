@@ -26,7 +26,7 @@ from zoneinfo import ZoneInfo
 
 from social import ensure_leads, platform_for_url, safe_url, add_lead
 from platform_sources import SOURCE_TYPES, ensure_watches, valid_source
-from eventbrite_preview import SEARCH_MODES, preview_search
+from eventbrite_preview import SEARCH_MODES, preview_search, safe_search_markup
 
 ROOT = Path(__file__).resolve().parent
 TZ = ZoneInfo('America/New_York')
@@ -65,6 +65,7 @@ h1{font-size:32px;letter-spacing:-.9px;line-height:1.2;margin:0 0 8px}.sub{color
 .status{display:inline-block;padding:4px 8px;border-radius:15px;background:#edf1f5;color:#425466;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.4px}.status.approved{background:#daf6e8;color:#087044}.status.posted{background:#e4eafe;color:#174fc1}.status.rejected,.status.dismissed{background:#fbe9e9;color:#a22a2a}.status.needs_details{background:#fff0d4;color:#9e5900}.empty{padding:48px 22px;background:white;border:1px dashed #cad0d9;border-radius:14px;text-align:center;color:var(--muted)}
 .formbox{max-width:790px;background:#fff;border:1px solid var(--line);border-radius:14px;padding:25px;margin:20px 0}.formgrid{display:grid;grid-template-columns:1fr 1fr;gap:15px}label{display:block;font-weight:700;margin-bottom:5px;font-size:13px}input,select,textarea{width:100%;border:1px solid #cbd2dc;border-radius:7px;padding:11px 12px;font:inherit;background:#fff;color:#111827}textarea{min-height:105px;resize:vertical}input[type=checkbox]{width:auto;margin:0 9px 0 0}.field{margin-bottom:14px}.field-hint{font-size:12px;color:var(--muted);margin:5px 0}.check{display:flex;align-items:start;font-weight:500}.formactions{display:flex;gap:10px;flex-wrap:wrap;margin-top:20px}.error{background:#fef0ee;border:1px solid #eeb4ac;color:#9c2c22;padding:13px 16px;border-radius:9px;margin:15px 0}.notice{background:#ecf5ff;border:1px solid #d2e8fd;color:#244866;padding:13px 16px;border-radius:9px;margin:15px 0}.section-title{font-size:19px;margin:25px 0 12px}.footer{color:#76818e;font-size:12px;margin:35px 0;text-align:center}
 .lead-text{white-space:pre-wrap;overflow-wrap:anywhere}.two{display:grid;grid-template-columns:1fr 1fr;gap:16px}.mini-form{display:flex;gap:10px;align-items:end}.mini-form input{flex:1}.scanbox{display:flex;justify-content:space-between;gap:20px;align-items:center;background:white;border:1px solid var(--line);border-radius:12px;padding:16px;margin:0 0 20px}.scanbox p{margin:4px 0}.scanbox form{flex-shrink:0}.scanlog{white-space:pre-wrap;word-wrap:break-word;background:#f0f3f7;border-radius:8px;padding:16px;max-height:490px;overflow:auto;font:12px/1.55 ui-monospace,monospace}
+.preview-media{height:180px;background:#eef2f6;display:flex;align-items:center;justify-content:center;color:#75818d;font-size:13px;overflow:hidden}.preview-media img{width:100%;height:100%;object-fit:cover}.preview-copy strong{font-weight:750}.preview-copy em{font-style:italic}.preview-note{display:inline-block;margin-top:4px;font-size:12px;color:#546476}
 @media(max-width:730px){.stats{grid-template-columns:repeat(2,1fr)}.formgrid,.two{grid-template-columns:1fr}.shell{padding:0 14px}.list{grid-template-columns:1fr}h1{font-size:27px}}
 '''
 
@@ -320,19 +321,29 @@ def eventbrite_preview_page(results=None, mode='general', error=''):
     else:
         rows = []
         for item in results:
-            rows.append(f'''<article class="event"><div class="content"><div class="meta">UNVERIFIED SEARCH RESULT · EVENTBRITE</div>
-<h2>{esc(item['title'])}</h2><p class="excerpt">{esc(item['snippet'])}</p>
+            # Search API thumbnails are transient preview images; they are never
+            # persisted or treated as reupload permission.
+            img = item.get('thumbnail', '')
+            media = (f'<div class="preview-media"><img src="{esc(img)}" loading="lazy" '
+                     f'alt="Search result thumbnail (unverified event flyer)" referrerpolicy="no-referrer"></div>') if img else \
+                    '<div class="preview-media">No preview image in search result</div>'
+            title = esc(item.get('title', 'Eventbrite event link'))
+            formatted = safe_search_markup(item.get('snippet', ''))
+            hint = f'<div class="preview-note">Date mentioned in listing: {esc(item["date_hint"])} · verify on Eventbrite</div>' \
+                   if item.get('date_hint') else '<div class="preview-note">Date not verified · check the original event page</div>'
+            rows.append(f'''<article class="event">{media}<div class="content"><div class="meta">UNVERIFIED SEARCH RESULT · EVENTBRITE</div>
+<h2>{title}</h2>{hint}<p class="excerpt preview-copy">{formatted}</p>
 <div class="links"><a href="{esc(item['url'])}" rel="noopener noreferrer" target="_blank">Open on Eventbrite ↗</a></div>
-<p class="small">Verify the actual event date, Newark venue and organizer independently. To keep a verified listing, manually add the event using the original Eventbrite page.</p></div></article>''')
-        display = f'<h2 class="section-title">{len(results)} indexed link(s) to inspect</h2><div class="list">{"".join(rows)}</div>'
+<p class="small">Verify the date, Newark venue and organizer on the original page. To keep a listing, manually add verified details; preview results are not stored.</p></div></article>''')
+        display = f'<h2 class="section-title">{len(results)} candidate link(s) to inspect</h2><div class="list">{"".join(rows)}</div>'
     body = f'''<h1>Eventbrite discovery preview</h1>
-<p class="sub">A one-time Newark web search. Does not save search results, create Social Leads, or publish to Reddit. Search results can include old events or other locations.</p>
+<p class="sub">A one-time Newark web search. Does not save search results, create Social Leads, or publish to Reddit. We filter clearly past dates when present in titles, but ambiguous dates and locations still need manual verification.</p>
 {'<div class="error">'+esc(error)+'</div>' if error else ''}
 <section class="formbox"><h2 style="margin-top:0">Find Eventbrite links</h2>
 <form method="post" action="/eventbrite/preview">{hidden()}
 <div class="field"><label for="category">Search category</label><select name="category" id="category">{options}</select></div>
 <button class="btn primary" type="submit">Search Newark Eventbrite</button></form>
-<p class="field-hint">Requires BRAVE_SEARCH_API_KEY in Railway. Each click uses one Brave Search API request. Results are shown temporarily and are never written to the Event Desk database.</p></section>
+<p class="field-hint">Requires BRAVE_SEARCH_API_KEY in Railway. Each click uses one Brave Search API request. Images display only when Brave supplies a thumbnail. Results are shown temporarily and are never written to the Event Desk database.</p></section>
 {display}
 <p class="small">Only content you verify independently on an organizer's public page should be manually entered into the editorial queue. <a href="/events/new">Add verified event manually ↗</a></p>'''
     return wrapper('Eventbrite search preview', body)
