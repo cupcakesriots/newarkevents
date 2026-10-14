@@ -13,6 +13,8 @@ import html
 import os
 import re
 import secrets
+import subprocess
+import threading
 import sqlite3
 import sys
 from datetime import datetime, timezone
@@ -27,6 +29,8 @@ from social import ensure_leads, platform_for_url, safe_url, add_lead
 ROOT = Path(__file__).resolve().parent
 TZ = ZoneInfo('America/New_York')
 CSRF = secrets.token_urlsafe(32)
+SCAN_LOCK = threading.Lock()
+SCAN_ACTIVE = False
 
 # A lightweight environment loader so the dashboard works without the collector's dependencies.
 def load_env(path: Path):
@@ -58,7 +62,7 @@ h1{font-size:32px;letter-spacing:-.9px;line-height:1.2;margin:0 0 8px}.sub{color
 .flyer{height:180px;background:#e7edf3;display:flex;align-items:center;justify-content:center;color:#6e7b8b;overflow:hidden}.flyer img{width:100%;height:100%;object-fit:cover}.content{padding:17px;flex:1;display:flex;flex-direction:column}.content h2{font-size:19px;line-height:1.3;letter-spacing:-.3px;margin:8px 0}.meta{font-size:12px;color:#55616d;font-weight:650}.excerpt{font-size:13px;color:#44505c;margin:8px 0 12px;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}.links{font-size:13px;margin:auto 0 12px}.links a{margin-right:10px}.actions{display:flex;gap:7px;flex-wrap:wrap;border-top:1px solid var(--line);padding-top:13px}.actions form{margin:0}
 .status{display:inline-block;padding:4px 8px;border-radius:15px;background:#edf1f5;color:#425466;font-size:11px;font-weight:800;text-transform:uppercase;letter-spacing:.4px}.status.approved{background:#daf6e8;color:#087044}.status.posted{background:#e4eafe;color:#174fc1}.status.rejected,.status.dismissed{background:#fbe9e9;color:#a22a2a}.status.needs_details{background:#fff0d4;color:#9e5900}.empty{padding:48px 22px;background:white;border:1px dashed #cad0d9;border-radius:14px;text-align:center;color:var(--muted)}
 .formbox{max-width:790px;background:#fff;border:1px solid var(--line);border-radius:14px;padding:25px;margin:20px 0}.formgrid{display:grid;grid-template-columns:1fr 1fr;gap:15px}label{display:block;font-weight:700;margin-bottom:5px;font-size:13px}input,select,textarea{width:100%;border:1px solid #cbd2dc;border-radius:7px;padding:11px 12px;font:inherit;background:#fff;color:#111827}textarea{min-height:105px;resize:vertical}input[type=checkbox]{width:auto;margin:0 9px 0 0}.field{margin-bottom:14px}.field-hint{font-size:12px;color:var(--muted);margin:5px 0}.check{display:flex;align-items:start;font-weight:500}.formactions{display:flex;gap:10px;flex-wrap:wrap;margin-top:20px}.error{background:#fef0ee;border:1px solid #eeb4ac;color:#9c2c22;padding:13px 16px;border-radius:9px;margin:15px 0}.notice{background:#ecf5ff;border:1px solid #d2e8fd;color:#244866;padding:13px 16px;border-radius:9px;margin:15px 0}.section-title{font-size:19px;margin:25px 0 12px}.footer{color:#76818e;font-size:12px;margin:35px 0;text-align:center}
-.lead-text{white-space:pre-wrap;overflow-wrap:anywhere}.two{display:grid;grid-template-columns:1fr 1fr;gap:16px}.mini-form{display:flex;gap:10px;align-items:end}.mini-form input{flex:1}
+.lead-text{white-space:pre-wrap;overflow-wrap:anywhere}.two{display:grid;grid-template-columns:1fr 1fr;gap:16px}.mini-form{display:flex;gap:10px;align-items:end}.mini-form input{flex:1}.scanbox{display:flex;justify-content:space-between;gap:20px;align-items:center;background:white;border:1px solid var(--line);border-radius:12px;padding:16px;margin:0 0 20px}.scanbox p{margin:4px 0}.scanbox form{flex-shrink:0}.scanlog{white-space:pre-wrap;word-wrap:break-word;background:#f0f3f7;border-radius:8px;padding:16px;max-height:490px;overflow:auto;font:12px/1.55 ui-monospace,monospace}
 @media(max-width:730px){.stats{grid-template-columns:repeat(2,1fr)}.formgrid,.two{grid-template-columns:1fr}.shell{padding:0 14px}.list{grid-template-columns:1fr}h1{font-size:27px}}
 '''
 
@@ -78,7 +82,55 @@ def db():
         image_approved INTEGER NOT NULL DEFAULT 0, reddit_url TEXT, created_at TEXT NOT NULL
     )''')
     ensure_leads(c)
+    c.execute('''CREATE TABLE IF NOT EXISTS scans (id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, finished_at TEXT, status TEXT NOT NULL, log TEXT NOT NULL DEFAULT '')''')
+    c.commit()
     return c
+
+
+
+def run_discovery(scan_id: int) -> None:
+    """Run collector in a background worker; a dashboard click NEVER publishes."""
+    global SCAN_ACTIVE
+    try:
+        cp = subprocess.run([sys.executable, str(ROOT/'aggregator.py'),
+                             '--db', str(DB_PATH), '--review', str(DB_PATH.parent/'review.csv'),
+                             'discover', '--days', '45'], cwd=ROOT, capture_output=True,
+                            text=True, timeout=900, check=False)
+        combined = (cp.stdout + '\n' + cp.stderr)[-18000:]
+        status = 'completed' if cp.returncode == 0 else 'failed'
+    except Exception as exc:
+        status, combined = 'failed', f'{type(exc).__name__}: {exc}'
+    try:
+        with db() as conn:
+            conn.execute('UPDATE scans SET finished_at=?,status=?,log=? WHERE id=?',
+                         (datetime.now(timezone.utc).isoformat(), status, combined, scan_id))
+            conn.commit()
+    finally:
+        with SCAN_LOCK:
+            SCAN_ACTIVE = False
+
+
+def scan_section(conn):
+    recent = conn.execute('SELECT * FROM scans ORDER BY id DESC LIMIT 1').fetchone()
+    if recent:
+        info = f'Last scan: {esc(recent["started_at"][:16].replace("T", " "))} UTC · {esc(recent["status"])}'
+    else:
+        info = 'No scans run from the dashboard yet.'
+    form = btn_post('/scan/start', 'Scan for Events', 'btn dark')
+    return f'<section class="scanbox"><div><b>Discover upcoming Newark events</b><p class="small">City calendars and configured public sources. Instagram, Threads, Facebook and Nextdoor require approved API access. All discoveries go to review; no Reddit publishing.</p><p class="small">{info} · <a href="/scan">View scan results</a></p></div>{form}</section>'
+
+
+def scan_page(conn):
+    recent = conn.execute('SELECT * FROM scans ORDER BY id DESC LIMIT 1').fetchone()
+    if not recent:
+        content = '<p>No scan has been started yet.</p>'
+    else:
+        content = f'<p><b>Status:</b> {esc(recent["status"])} · Started {esc(recent["started_at"])} UTC</p>'
+        if recent['status'] == 'running':
+            content += '<p>Source scanning can take several minutes. Refresh this page for an update.</p>'
+        if recent['log']:
+            content += f'<pre class="scanlog">{esc(recent["log"])}</pre>'
+    return wrapper('Event scan status',f'<h1>Event discovery</h1><p class="sub">Public event sources and authorized API connections only. No posts are sent to Reddit.</p><section class="formbox">{content}<p><a class="btn" href="/">← Back to dashboard</a></p></section>')
 
 
 def local_time(iso):
@@ -194,7 +246,7 @@ def event_list(conn, params):
     search = f'''<form method="get" action="/" class="mini-form"><input type="hidden" name="status" value="{esc(status)}"><input aria-label="Search events" placeholder="Search events, venues..." name="q" value="{esc(term)}"><button class="btn" type="submit">Search</button></form>'''
     cards = ''.join(event_card(r) for r in rows) or '<div class="empty">Nothing here yet. Run the collector or add an event manually.</div>'
     html_body = f'''<h1>Newark events, curated.</h1><p class="sub">Discover what's happening in Brick City. Verify the details. Approve only what belongs on r/newarkevents.</p>
-<div class="stats">{summarize_status(conn)}</div><div class="toolbar"><div class="tabs">{tabs}</div><a class="btn primary" href="/events/new">+ Add an event</a></div>{search}<h2 class="section-title">{len(rows)} event(s)</h2><div class="list">{cards}</div>'''
+<div class="stats">{summarize_status(conn)}</div>{scan_section(conn)}<div class="toolbar"><div class="tabs">{tabs}</div><a class="btn primary" href="/events/new">+ Add an event</a></div>{search}<h2 class="section-title">{len(rows)} event(s)</h2><div class="list">{cards}</div>'''
     return wrapper('Event review', html_body)
 
 
@@ -216,10 +268,10 @@ def leads_page(conn, params):
     sql = 'SELECT * FROM social_leads' + (' WHERE status=?' if status != 'all' else '') + ' ORDER BY discovered_at DESC LIMIT 300'
     rows = conn.execute(sql, (status,) if status != 'all' else ()).fetchall()
     tabs = ''.join(f'<a class="tab {"sel" if v == status else ""}" href="/leads?status={v}">{label}</a>' for v,label in [('needs_details','Needs details'),('converted','Added as event'),('dismissed','Dismissed'),('all','All')])
-    body = f'''<h1>Social discovery inbox</h1><p class="sub">Potential Newark event announcements from Instagram, Threads, Facebook or pasted links. These are leads, not verified calendar events.</p>
+    body = f'''<h1>Social discovery inbox</h1><p class="sub">Potential Newark event announcements from Instagram, Threads, Facebook, Nextdoor or pasted links. These are leads, not verified calendar events.</p>
 <div class="toolbar"><div class="tabs">{tabs}</div><a class="btn" href="/">← Back to event review</a></div>
-<section class="formbox"><h2 style="margin-top:0">Paste an event post</h2><p class="small">Use this for Instagram, Threads or Facebook posts the APIs cannot access.</p>
-<form method="post" action="/leads/add">{hidden()}<div class="field"><label>Original social post URL</label><input name="original_post_url" required placeholder="https://www.instagram.com/p/..."></div>
+<section class="formbox"><h2 style="margin-top:0">Paste an event post</h2><p class="small">Use this for Instagram, Threads, Facebook or Nextdoor posts the APIs cannot access. Private or login-only posts must be reviewed manually.</p>
+<form method="post" action="/leads/add">{hidden()}<div class="field"><label>Original social post URL</label><input name="original_post_url" required placeholder="https://nextdoor.com/... or https://www.instagram.com/p/..."></div>
 <div class="field"><label>Caption or event notes (optional)</label><textarea name="post_text" placeholder="Paste the event details you've seen, including date, time and venue if available"></textarea></div><button class="btn primary" type="submit">Add to social leads</button></form></section>
 <h2 class="section-title">{len(rows)} social lead(s)</h2><div class="list">{''.join(lead_card(r) for r in rows) or '<div class="empty">No social leads yet. Paste a link above or configure Meta API access.</div>'}</div>'''
     return wrapper('Social discovery', body)
@@ -311,6 +363,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if u.path == '/':
                 self.respond(event_list(conn, params)); return
+            if u.path == '/scan':
+                self.respond(scan_page(conn)); return
             if u.path == '/leads':
                 self.respond(leads_page(conn, params)); return
             if u.path == '/events/new':
@@ -343,6 +397,22 @@ class Handler(BaseHTTPRequestHandler):
     def process_post(self, u, form):
         conn = db()
         try:
+            if u.path == '/scan/start':
+                global SCAN_ACTIVE
+                with SCAN_LOCK:
+                    if SCAN_ACTIVE:
+                        self.redirect('/scan'); return
+                    SCAN_ACTIVE = True
+                    try:
+                        cursor = conn.execute('INSERT INTO scans (started_at,status) VALUES (?,?)',
+                                              (datetime.now(timezone.utc).isoformat(), 'running'))
+                        conn.commit()
+                        thread = threading.Thread(target=run_discovery, args=(cursor.lastrowid,), daemon=True)
+                        thread.start()
+                    except Exception:
+                        SCAN_ACTIVE = False
+                        raise
+                self.redirect('/scan'); return
             if u.path == '/leads/add':
                 url = form.get('original_post_url',[''])[0]
                 if not safe_url(url): raise ValueError('Enter a valid social post URL')

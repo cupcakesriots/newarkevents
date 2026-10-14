@@ -1,6 +1,21 @@
 {
   "meta_graph_version": "v26.0",
-  "threads_queries": ["Newark events", "Newark NJ", "Newark weekend", "Newark arts"],
-  "instagram_hashtags": ["newarkevents", "newarknj", "newarkarts", "brickcityevents"],
-  "facebook_pages": []
+  "threads_queries": [
+    "Newark events",
+    "Newark NJ",
+    "Newark weekend",
+    "Newark arts"
+  ],
+  "instagram_hashtags": [
+    "newarkevents",
+    "newarknj",
+    "newarkarts",
+    "brickcityevents"
+  ],
+  "facebook_pages": [],
+  "nextdoor": {
+    "lat": 40.7357,
+    "lon": -74.1724,
+    "radius_miles": 4
+  }
 }

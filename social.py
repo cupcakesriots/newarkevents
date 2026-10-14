@@ -1,6 +1,7 @@
 """Optional, permissioned Meta discovery connectors. Output is UNVERIFIED leads, never publishable events.
 
 Only official Meta API endpoints are called. Public Facebook Events search is not supported.
+Nextdoor public event search requires approved API access; manually paste any other social link.
 No unofficial scraping, cookies, browser automation, or private content access.
 """
 from __future__ import annotations
@@ -56,6 +57,8 @@ def platform_for_url(value: str) -> str:
         return 'Threads'
     if host in ('facebook.com', 'fb.com', 'm.facebook.com'):
         return 'Facebook'
+    if host in ('nextdoor.com', 'us.nextdoor.com'):
+        return 'Nextdoor'
     return 'Community link'
 
 
@@ -153,6 +156,53 @@ def collect_facebook_pages(conn, pages: list[dict], api_version: str, limit: int
     return added
 
 
+
+def collect_nextdoor(conn, token: str, settings: dict | None = None) -> int:
+    """Official Displaying Content / Search Events API; no login-session scraping.
+
+    Results are geographic *leads*, not Newark-verified entries. Nextdoor's
+    radius may include nearby towns, so a curator must verify the address.
+    """
+    settings = settings or {}
+    query = {
+        'lat': round(float(settings.get('lat', 40.7357)), 3),
+        'lon': round(float(settings.get('lon', -74.1724)), 3),
+        'radius': min(max(float(settings.get('radius_miles', 4)), 0.5), 10),
+    }
+    res = requests.get(
+        'https://nextdoor.com/content_api/v2/search_event',
+        params=query,
+        headers={'Authorization': f'Bearer {token}', 'Accept': 'application/json'},
+        timeout=TIMEOUT,
+    )
+    res.raise_for_status()
+    payload = res.json()
+    if isinstance(payload, list):
+        entries = payload
+    elif isinstance(payload, dict):
+        if 'error' in payload:
+            raise RuntimeError('Nextdoor API rejected the request: ' + str(payload['error'])[:300])
+        entries = next((payload[k] for k in ('events', 'data', 'results', 'items') if isinstance(payload.get(k), list)), None)
+        if entries is None:
+            raise ValueError('Unexpected Nextdoor API response; no event list found')
+    else:
+        raise ValueError('Unexpected Nextdoor API response type')
+    added = 0
+    for entry in entries[:100]:
+        if not isinstance(entry, dict) or entry.get('available') is False:
+            continue
+        source_url = entry.get('url') or ''
+        if not safe_url(source_url):
+            continue
+        # A search radius is *not* evidence that a listing is located in Newark.
+        title = str(entry.get('title') or '').strip()
+        details = str(entry.get('description') or '').strip()
+        when = str(entry.get('start_time') or '').strip()
+        note = '\n'.join(x for x in [title, f'Event start: {when}' if when else '', details, 'LOCATION UNVERIFIED: check that event address is in Newark, NJ.'] if x)
+        added += add_lead(conn, 'Nextdoor', source_url, note, '', entry.get('cover_photo') or '')
+    return added
+
+
 def collect_social(conn: sqlite3.Connection, config_path: Path | None = None) -> tuple[int, list[str]]:
     """Skip missing credentials instead of implying public unrestricted search is available."""
     ensure_leads(conn)
@@ -183,4 +233,12 @@ def collect_social(conn: sqlite3.Connection, config_path: Path | None = None) ->
         added += n; enabled.append(f'Facebook authorized Pages: {n} new lead(s)')
     except (requests.RequestException, RuntimeError, ValueError) as exc:
         enabled.append(f'Facebook ERROR: {exc}')
+    if os.getenv('NEXTDOOR_ACCESS_TOKEN'):
+        try:
+            n = collect_nextdoor(conn, os.environ['NEXTDOOR_ACCESS_TOKEN'], cfg.get('nextdoor', {}))
+            added += n; enabled.append(f'Nextdoor: {n} new lead(s) - verify Newark location')
+        except (requests.RequestException, RuntimeError, ValueError) as exc:
+            enabled.append(f'Nextdoor ERROR (API access may be unavailable): {exc}')
+    else:
+        enabled.append('Nextdoor skipped: approved NEXTDOOR_ACCESS_TOKEN not configured; paste event links manually')
     return added, enabled
