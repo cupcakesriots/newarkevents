@@ -138,6 +138,55 @@ def _collect_individual(kind: str, link: str, token: str):
 
 
 
+
+# Some Luma iCal entries put the actual event link in DESCRIPTION, while the
+# generic iCal reader falls back to the subscription URL if URL is absent.
+# A subscription URL must never be used as an individual event's detail link.
+_LUMA_LINK = re.compile(r'https?://(?:www\.)?(?:luma\.com|lu\.ma)/[A-Za-z0-9][A-Za-z0-9_/-]{2,100}', re.I)
+
+
+def resolve_luma_event_url(event) -> str:
+    """Resolve a public Luma event URL, preferring the iCal URL over DESCRIPTION.
+
+    DESCRIPTION is used only if it contains a genuine individual Luma event URL;
+    never assume the calendar feed is itself an event or invent a page URL.
+    """
+    from aggregator import canonical_url
+    for field in ('original_post_url', 'event_url'):
+        value = str(getattr(event, field, '') or '')
+        if _luma_event_page(value):
+            return canonical_url(value)
+    for field in ('description', 'original_post_url', 'event_url'):
+        value = str(getattr(event, field, '') or '')
+        for match in _LUMA_LINK.finditer(value):
+            candidate = canonical_url(match.group(0).rstrip('/.,;:'))
+            if _luma_event_page(candidate):
+                return candidate
+    return ''
+
+
+def _is_luma_feed_link(value: str) -> bool:
+    p = urlparse(str(value or ''))
+    return p.scheme in ('https', 'http') and p.hostname in (
+        'api.luma.com', 'api2.luma.com', 'api.lu.ma', 'api2.lu.ma'
+    ) and p.path.startswith('/ics/')
+
+
+def normalize_luma_events(events: list) -> int:
+    """Repair source URLs on new event objects without changing their identity."""
+    resolved = 0
+    for event in events:
+        url = resolve_luma_event_url(event)
+        if not url:
+            continue
+        if not _luma_event_page(event.original_post_url):
+            event.original_post_url = url
+        if not _luma_event_page(event.event_url):
+            event.event_url = url
+        resolved += 1
+    return resolved
+
+
 def _luma_event_page(url: str) -> bool:
     """Only fetch a real Luma event page, not an arbitrary iCal-provided URL."""
     parsed = urlparse(url or '')
@@ -197,36 +246,58 @@ def luma_cover_image(event_url: str) -> str:
     return ''
 
 
-def add_luma_images(conn: sqlite3.Connection, events: list) -> tuple[int, int]:
-    """Fill blank Luma cards without changing existing moderation decisions."""
+def add_luma_images(conn: sqlite3.Connection, events: list, diagnostics: dict | None = None) -> tuple[int, int]:
+    """Fill missing photos AND repair broken feed URLs on queued Luma cards.
+
+    Never change moderation status, photo permission, or other event sources.
+    Failures are counted in scan diagnostics rather than hidden as "0 found".
+    """
     from aggregator import stable_key
+    diagnostics = diagnostics if diagnostics is not None else {}
     found = 0
     updated = 0
-    # Cap extra page fetches so a single public feed can't cause unlimited I/O.
+    # Each watched feed is capped to avoid unbounded remote page requests.
     for ev in events[:65]:
-        if ev.image_url or not _luma_event_page(ev.original_post_url or ev.event_url):
+        page_url = resolve_luma_event_url(ev)
+        if not page_url:
+            diagnostics['missing_event_url'] = diagnostics.get('missing_event_url', 0) + 1
             continue
-        existing = conn.execute('SELECT image_url, source, status FROM events WHERE key=?',
-                                (stable_key(ev),)).fetchone()
-        # Don't refetch pages with working images or edit rejected/published cards.
-        if existing and (existing['image_url'] or existing['source'] != 'Luma'
-                         or existing['status'] not in ('pending', 'approved')):
+        # Repair objects before upsert so new records link to the real event page.
+        ev.original_post_url = page_url if not _luma_event_page(ev.original_post_url) else ev.original_post_url
+        ev.event_url = page_url if not _luma_event_page(ev.event_url) else ev.event_url
+        key = stable_key(ev)
+        existing = conn.execute('SELECT image_url,source,status,event_url,original_post_url FROM events WHERE key=?',
+                                (key,)).fetchone()
+        if existing and existing['source'] == 'Luma' and existing['status'] in ('pending', 'approved'):
+            # Fix older listings pointing to api.luma.com/ics/get (not an event page).
+            if _is_luma_feed_link(existing['event_url']) or not existing['event_url']:
+                conn.execute('UPDATE events SET event_url=? WHERE key=?', (page_url, key))
+                diagnostics['fixed_detail_links'] = diagnostics.get('fixed_detail_links', 0) + 1
+            if _is_luma_feed_link(existing['original_post_url']) or not existing['original_post_url']:
+                conn.execute('UPDATE events SET original_post_url=? WHERE key=?', (page_url, key))
+        if ev.image_url or (existing and existing['image_url']):
+            continue
+        if existing and (existing['source'] != 'Luma' or existing['status'] not in ('pending', 'approved')):
             continue
         try:
-            cover = luma_cover_image(ev.original_post_url or ev.event_url)
-        except Exception:
-            continue  # Keep event discovery working if the page isn't available.
+            cover = luma_cover_image(page_url)
+        except Exception as exc:
+            diagnostics['fetch_errors'] = diagnostics.get('fetch_errors', 0) + 1
+            if not diagnostics.get('first_error'):
+                status = getattr(getattr(exc, 'response', None), 'status_code', None)
+                diagnostics['first_error'] = f'{type(exc).__name__} HTTP {status}' if status else type(exc).__name__
+            continue
         if not cover:
+            diagnostics['no_cover'] = diagnostics.get('no_cover', 0) + 1
             continue
         ev.image_url = cover
         found += 1
-        # Existing status, attribution and image-rights flag are untouched.
         result = conn.execute("""UPDATE events SET image_url=?
             WHERE key=? AND source='Luma' AND status IN ('pending','approved')
-            AND (image_url IS NULL OR trim(image_url)='')""",
-            (cover, stable_key(ev)))
+            AND (image_url IS NULL OR trim(image_url)='')""", (cover, key))
         updated += result.rowcount
     return found, updated
+
 
 def run_watches(conn: sqlite3.Connection, now, days: int) -> tuple[int, list[str]]:
     from aggregator import scan_ical, qualify, upsert, is_newark
@@ -265,8 +336,18 @@ def run_watches(conn: sqlite3.Connection, now, days: int) -> tuple[int, list[str
             qualifying = [ev for ev in events if qualify(ev, now, days)]
             photo_note = ''
             if kind in ('luma_ical', 'luma_event'):
-                photos_found, photos_backfilled = add_luma_images(conn, qualifying)
-                photo_note = f', {photos_found} cover image(s) found, {photos_backfilled} existing card(s) updated'
+                diagnostics = {}
+                resolved = normalize_luma_events(qualifying)
+                photos_found, photos_backfilled = add_luma_images(conn, qualifying, diagnostics)
+                photo_note = (f', {resolved} real event link(s), {photos_found} cover image(s) found, '
+                              f'{photos_backfilled} existing card(s) updated, '
+                              f'{diagnostics.get("fixed_detail_links", 0)} old detail link(s) repaired')
+                if diagnostics.get('missing_event_url'):
+                    photo_note += f', {diagnostics["missing_event_url"]} without event page URL'
+                if diagnostics.get('fetch_errors'):
+                    photo_note += f', {diagnostics["fetch_errors"]} image page request error(s) ({diagnostics["first_error"]})'
+                if diagnostics.get('no_cover'):
+                    photo_note += f', {diagnostics["no_cover"]} page(s) without usable cover metadata'
             count = sum(upsert(conn, ev) for ev in qualifying)
             added += count
             # Avoid assuming all events from a Luma calendar or Eventbrite org are physically in Newark.
@@ -284,3 +365,4 @@ def run_watches(conn: sqlite3.Connection, now, days: int) -> tuple[int, list[str
     if not rows:
         messages.append('Luma/Eventbrite: no watched sources configured; add them under Sources in the dashboard')
     return added, messages
+
