@@ -1,0 +1,33 @@
+{
+  "ical": [
+    {
+      "name": "City of Newark Events",
+      "url": "https://www.newarknj.gov/common/modules/iCalendar/iCalendar.aspx?catID=23&feed=calendar",
+      "assume_newark": true,
+      "auto_approve": false
+    }
+  ],
+  "rss": [],
+  "websites": [
+    {
+      "name": "NJPAC",
+      "url": "https://www.njpac.org/tickets-events/",
+      "event_path_prefix": "/event/",
+      "assume_newark": true,
+      "default_venue": "New Jersey Performing Arts Center",
+      "default_address": "1 Center Street, Newark, NJ 07102",
+      "max_links": 45,
+      "auto_approve": false
+    },
+    {
+      "name": "Newark Museum of Art",
+      "url": "https://newarkmuseumart.org/events/",
+      "event_path_prefix": "/event/",
+      "assume_newark": true,
+      "default_venue": "The Newark Museum of Art",
+      "default_address": "49 Washington Street, Newark, NJ 07102",
+      "max_links": 45,
+      "auto_approve": false
+    }
+  ]
+}
