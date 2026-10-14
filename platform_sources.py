@@ -9,7 +9,8 @@ import os
 import re
 import sqlite3
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from functools import lru_cache
+from urllib.parse import urljoin, urlparse
 
 import requests
 
@@ -135,6 +136,98 @@ def _collect_individual(kind: str, link: str, token: str):
     return events
 
 
+
+
+def _luma_event_page(url: str) -> bool:
+    """Only fetch a real Luma event page, not an arbitrary iCal-provided URL."""
+    parsed = urlparse(url or '')
+    return (parsed.scheme == 'https' and parsed.hostname in
+            ('luma.com', 'www.luma.com', 'lu.ma', 'www.lu.ma')
+            and parsed.path not in ('', '/', '/discover', '/calendar'))
+
+
+def _trusted_luma_image(page_url: str, raw: str) -> str:
+    """Accept real Luma CDN images, never arbitrary third-party image hosts."""
+    raw = (raw or '').strip()
+    if not raw or raw.lower().startswith(('data:', 'javascript:')):
+        return ''
+    url = urljoin(page_url, raw)
+    parsed = urlparse(url)
+    host = (parsed.hostname or '').lower()
+    if (parsed.scheme == 'https' and not parsed.username and not parsed.password
+            and (host == 'lumacdn.com' or host.endswith('.lumacdn.com')
+                 or host in ('luma.com', 'www.luma.com', 'lu.ma', 'www.lu.ma'))):
+        return url
+    return ''
+
+
+@lru_cache(maxsize=512)
+def luma_cover_image(event_url: str) -> str:
+    """Find an event cover on the public Luma page (OG preview if necessary).
+
+    iCal feeds list events but normally omit images. This fetches the event's
+    own public page; it uses no private API, login or access-control bypass.
+    """
+    if not _luma_event_page(event_url):
+        return ''
+    from aggregator import soup_for, meta, image_field, extract_jsonld
+    soup = soup_for(event_url)
+    # Prefer the actual cover to organizer avatars or branded social previews.
+    for img in soup.find_all('img'):
+        alt = (img.get('alt') or '').casefold()
+        if 'cover image' not in alt and 'event cover' not in alt:
+            continue
+        for attr in ('src', 'data-src', 'data-original'):
+            url = _trusted_luma_image(event_url, img.get(attr) or '')
+            if url:
+                return url
+        srcset = img.get('srcset') or ''
+        if srcset:
+            url = _trusted_luma_image(event_url, srcset.split(',')[0].strip().split(' ')[0])
+            if url:
+                return url
+    for candidate in (meta(soup, 'og:image'), meta(soup, 'twitter:image')):
+        url = _trusted_luma_image(event_url, candidate)
+        if url:
+            return url
+    for node in extract_jsonld(soup):
+        url = _trusted_luma_image(event_url, image_field(node.get('image')))
+        if url:
+            return url
+    return ''
+
+
+def add_luma_images(conn: sqlite3.Connection, events: list) -> tuple[int, int]:
+    """Fill blank Luma cards without changing existing moderation decisions."""
+    from aggregator import stable_key
+    found = 0
+    updated = 0
+    # Cap extra page fetches so a single public feed can't cause unlimited I/O.
+    for ev in events[:65]:
+        if ev.image_url or not _luma_event_page(ev.original_post_url or ev.event_url):
+            continue
+        existing = conn.execute('SELECT image_url, source, status FROM events WHERE key=?',
+                                (stable_key(ev),)).fetchone()
+        # Don't refetch pages with working images or edit rejected/published cards.
+        if existing and (existing['image_url'] or existing['source'] != 'Luma'
+                         or existing['status'] not in ('pending', 'approved')):
+            continue
+        try:
+            cover = luma_cover_image(ev.original_post_url or ev.event_url)
+        except Exception:
+            continue  # Keep event discovery working if the page isn't available.
+        if not cover:
+            continue
+        ev.image_url = cover
+        found += 1
+        # Existing status, attribution and image-rights flag are untouched.
+        result = conn.execute("""UPDATE events SET image_url=?
+            WHERE key=? AND source='Luma' AND status IN ('pending','approved')
+            AND (image_url IS NULL OR trim(image_url)='')""",
+            (cover, stable_key(ev)))
+        updated += result.rowcount
+    return found, updated
+
 def run_watches(conn: sqlite3.Connection, now, days: int) -> tuple[int, list[str]]:
     from aggregator import scan_ical, qualify, upsert, is_newark
     ensure_watches(conn)
@@ -170,6 +263,10 @@ def run_watches(conn: sqlite3.Connection, now, days: int) -> tuple[int, list[str
                 messages.append(f'{label}: no machine-readable event details; {int(n)} unverified lead(s)')
                 continue
             qualifying = [ev for ev in events if qualify(ev, now, days)]
+            photo_note = ''
+            if kind in ('luma_ical', 'luma_event'):
+                photos_found, photos_backfilled = add_luma_images(conn, qualifying)
+                photo_note = f', {photos_found} cover image(s) found, {photos_backfilled} existing card(s) updated'
             count = sum(upsert(conn, ev) for ev in qualifying)
             added += count
             # Avoid assuming all events from a Luma calendar or Eventbrite org are physically in Newark.
@@ -180,7 +277,7 @@ def run_watches(conn: sqlite3.Connection, now, days: int) -> tuple[int, list[str
                 if kind in ('luma_event','eventbrite_event') or 'newark' in (ev.address+' '+ev.venue+' '+ev.title+' '+ev.description).lower():
                     needs_details += int(add_lead(conn, ev.source, ev.original_post_url or ev.event_url,
                         f'{ev.title}\nStarts: {ev.start}\nLocation not verified as Newark, NJ: {ev.address or ev.venue}\n{ev.description}', ev.event_url, ev.image_url))
-            messages.append(f'{label}: {len(qualifying)} Newark events, {count} new pending, {needs_details} unverified lead(s)')
+            messages.append(f'{label}: {len(qualifying)} Newark events, {count} new pending, {needs_details} unverified lead(s){photo_note}')
         except Exception as exc:
             messages.append(f'{label}: ERROR {type(exc).__name__} ({str(exc)[:170]})')
     conn.commit()
