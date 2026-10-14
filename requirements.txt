@@ -1,0 +1,8 @@
+beautifulsoup4>=4.12,<5
+feedparser>=6.0,<7
+icalendar>=6.0,<7
+recurring-ical-events>=3.0,<4
+praw>=8.0,<9
+python-dotenv>=1.0,<2
+requests>=2.32,<3
+python-dateutil>=2.9,<3
